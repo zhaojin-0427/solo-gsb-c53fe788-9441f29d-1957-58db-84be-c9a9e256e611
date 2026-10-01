@@ -67,21 +67,26 @@ def _version_immutable(code: str, version: int):
     )
 
 
-def _raise_lost_race(db: Session, recipe: Recipe, version: int):
+def _raise_lost_race(db: Session, code: str, version: int, original_id):
     """Explain why a conditional draft write matched no row.
 
     The row was read as a draft but the guarded UPDATE/DELETE did not land,
     so a concurrent request committed first: either it published the version
     (the row is now immutable) or it deleted it (the version is gone).
+
+    The post-mortem looks the row up by the **original primary key**, never by
+    ``(recipe_id, version)``: version numbers may be reused after a delete, so
+    a concurrent delete followed by a create of a new draft with the same
+    version number would otherwise be mistaken for the row this request read.
+    UUID primary keys are not reused, so only two outcomes are possible:
+
+    - the original row is gone  -> 404 RECIPE_VERSION_NOT_FOUND;
+    - the original row survived and is published -> 409 RECIPE_VERSION_IMMUTABLE.
     """
-    current = (
-        db.query(RecipeVersion)
-        .filter(RecipeVersion.recipe_id == recipe.id, RecipeVersion.version == version)
-        .first()
-    )
+    current = db.get(RecipeVersion, original_id)
     if current is None:
-        raise _version_not_found(recipe.code, version)
-    raise _version_immutable(recipe.code, version)
+        raise _version_not_found(code, version)
+    raise _version_immutable(code, version)
 
 
 @router.post("", status_code=201)
@@ -153,9 +158,12 @@ def replace_version(
     """
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
+    # Pin the identity of the row this request read; the failure path must
+    # judge this exact row, not whatever currently owns the version number.
+    original_id, recipe_code = rv.id, recipe.code
     updated = (
         db.query(RecipeVersion)
-        .filter(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .filter(RecipeVersion.id == original_id, RecipeVersion.status == "draft")
         .update(
             {
                 "items": [i.model_dump(mode="json") for i in body.items],
@@ -168,7 +176,7 @@ def replace_version(
     if updated != 1:
         # A concurrent publish or delete committed first; nothing was written.
         db.rollback()
-        _raise_lost_race(db, recipe, version)
+        _raise_lost_race(db, recipe_code, version, original_id)
     db.commit()
     db.refresh(rv)
     return serialize_version(rv)
@@ -183,15 +191,18 @@ def delete_version(code: str, version: int, db: Session = Depends(get_db)):
     """
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
+    # Pin the identity of the row this request read; the failure path must
+    # judge this exact row, not whatever currently owns the version number.
+    original_id, recipe_code = rv.id, recipe.code
     deleted = (
         db.query(RecipeVersion)
-        .filter(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .filter(RecipeVersion.id == original_id, RecipeVersion.status == "draft")
         .delete(synchronize_session=False)
     )
     if deleted != 1:
         # A concurrent publish or delete committed first; nothing was written.
         db.rollback()
-        _raise_lost_race(db, recipe, version)
+        _raise_lost_race(db, recipe_code, version, original_id)
     db.commit()
     return Response(status_code=204)
 
@@ -204,14 +215,21 @@ def publish_version(code: str, version: int, db: Session = Depends(get_db)):
     races atomically with draft replacement and deletion: it either freezes
     the newest committed draft content, or fails cleanly when the draft was
     deleted first (no snapshot is left behind).
+
+    The post-mortem after a lost race tracks the **original row id** read at
+    the top: a version number may be reused after a delete, so finding a fresh
+    draft with the same (recipe, version) must not look like a successful
+    publish of this request's row. Only when the original row itself survived
+    as ``published`` do we replay it (idempotent).
     """
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
+    original_id, recipe_code = rv.id, recipe.code
     if rv.status == "published":
         return serialize_version(rv)
     published = (
         db.query(RecipeVersion)
-        .filter(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .filter(RecipeVersion.id == original_id, RecipeVersion.status == "draft")
         .update(
             {"status": "published", "published_at": utcnow()},
             synchronize_session=False,
@@ -221,14 +239,14 @@ def publish_version(code: str, version: int, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(rv)
         return serialize_version(rv)
-    # Lost the race against a concurrent delete or publish.
+    # Lost the race against a concurrent delete or publish. Judge the exact
+    # row this request read, by primary key, never by (recipe, version): a
+    # concurrent delete + recreate with the same version number is a different
+    # row and must produce 404, not a 200 whose body still says "draft".
     db.rollback()
-    current = (
-        db.query(RecipeVersion)
-        .filter(RecipeVersion.recipe_id == recipe.id, RecipeVersion.version == version)
-        .first()
-    )
+    current = db.get(RecipeVersion, original_id)
     if current is None:
-        raise _version_not_found(recipe.code, version)
-    # A concurrent publish won; publishing is idempotent, so replay its state.
+        raise _version_not_found(recipe_code, version)
+    # The original row survived and is published (a concurrent publish won);
+    # publishing the same row again is idempotent, so replay its state.
     return serialize_version(current)
