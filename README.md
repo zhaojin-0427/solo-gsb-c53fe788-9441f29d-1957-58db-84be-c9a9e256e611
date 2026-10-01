@@ -323,9 +323,9 @@ curl -X POST http://localhost:8000/evaluations \
 ### 3.8 并发复验：草稿写与发布的原子胜负
 
 配方版本的草稿替换（`PUT`）、删除（`DELETE`）与发布（`publish`）在**数据库层**
-以版本状态原子地决定胜负：三个写操作都是带 `status = 'draft'` 守卫的条件
-UPDATE/DELETE，行锁 + 条件重估保证只有一个请求先提交生效，**不存在**
-“读到草稿 → 对方已发布 → 旧写仍然落库”的窗口。因此：
+以版本状态原子地决定胜负：三个写操作都是带 `status = 'draft'` 守卫、且**按最初
+读取的行主键（`id`）定位**的条件 UPDATE/DELETE，行锁 + 条件重估保证只有一个请求
+先提交生效，**不存在**“读到草稿 → 对方已发布 → 旧写仍然落库”的窗口。因此：
 
 | 竞速 | 先提交者 | 后到请求的结果 | 最终状态 |
 | ---- | ---- | ---- | ---- |
@@ -333,6 +333,83 @@ UPDATE/DELETE，行锁 + 条件重估保证只有一个请求先提交生效，*
 | PUT vs publish | PUT | publish 200 | 发布冻结**更新后**的草稿 |
 | DELETE vs publish | publish | `409 RECIPE_VERSION_IMMUTABLE` | 已发布行不被删除 |
 | DELETE vs publish | DELETE | `404 RECIPE_VERSION_NOT_FOUND` | 发布不成功，也不留快照 |
+| PUT/DELETE/publish vs **删除后同号重建** | 删除并新建草稿 | `404 RECIPE_VERSION_NOT_FOUND` | 原行已消失；**新草稿及其内容不受影响** |
+
+**删除后同号重建的身份判定**：旧请求读取旧草稿后，另一个请求先把该行**删除**，
+再用**相同配方号 + 版本号**创建一个全新草稿（新的行主键）。旧请求的条件写按行 id
+匹配，命中 0 行；失败重查也**只追踪最初读取的那个行 id**，而不是按
+`(配方, 版本号)` 重新查找——否则会把新行误判成旧行。于是：
+
+- 原行**已删除**：旧 PUT / DELETE / publish 一律返回
+  `404 RECIPE_VERSION_NOT_FOUND`，**新草稿保持 `draft`、内容原样**，可独立发布；
+- 原行**确已发布**：旧 PUT / DELETE 返回 `409 RECIPE_VERSION_IMMUTABLE`，
+  针对**同一原行**的重复 publish 保持幂等（200，回放冻结内容）。
+
+下面是与实现逐字一致的真实请求 / 响应示例（交错由测试在端点的读窗口内注入）。
+
+旧 PUT 在原行被删除并同号重建后得到 404，新草稿（7 g）原封不动：
+
+```http
+PUT /recipes/cake/versions/1
+Content-Type: application/json
+
+{"items":[{"kind":"ingredient","code":"sugar","quantity":99,"unit":"g"}]}
+```
+
+```json
+404 Not Found
+{"detail": {"code": "RECIPE_VERSION_NOT_FOUND",
+            "message": "recipe 'cake' has no version 1"}}
+```
+
+```http
+GET /recipes/cake/versions/1
+```
+
+```json
+200 OK
+{"version": 1, "status": "draft",
+ "items": [{"kind": "ingredient", "code": "sugar", "version": null,
+             "quantity": 7.0, "unit": "g"}],
+ "yield_quantity": null, "yield_unit": null,
+ "created_at": "2026-10-01T06:59:22.880689", "published_at": null}
+```
+
+旧 publish 在同样的删除—重建交错后**不再**谎称成功（修复前会返回 200 但响应体仍是
+`draft`，等于一次什么都没冻结的“发布”）：
+
+```http
+POST /recipes/cake/versions/1/publish
+```
+
+```json
+404 Not Found
+{"detail": {"code": "RECIPE_VERSION_NOT_FOUND",
+            "message": "recipe 'cake' has no version 1"}}
+```
+
+旧 DELETE 同理得到 `404` 且不会删掉新草稿：
+
+```http
+DELETE /recipes/cake/versions/1
+```
+
+```json
+404 Not Found
+{"detail": {"code": "RECIPE_VERSION_NOT_FOUND",
+            "message": "recipe 'cake' has no version 1"}}
+```
+
+而当原行**确实被发布**时，旧 PUT 仍是 409（新草稿与此无关，不会被牵连）：
+
+```json
+409 Conflict
+{"detail": {"code": "RECIPE_VERSION_IMMUTABLE",
+            "message": "recipe 'cake' version 1 is published and immutable"}}
+```
+
+针对**同一原行**再次 `POST .../publish` 始终幂等：首次 200 冻结、后续重复发布都
+返回同一个 `200 {"status": "published", ...}`。
 
 一键复验（对运行中的服务并发发起真实竞速，逐轮断言上述不变量）：
 
@@ -342,9 +419,10 @@ bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUND
 ```
 
 脚本同时报告观察到的提交顺序（如 `A_publish_first` / `A_put_first`），
-任一竞速组的不变量被破坏即以非零状态退出。对应的确定性回归测试见
+任一竞速组的不变量被破坏即以非零状态退出。**可控的删除—重建交错**无法用网络竞速
+稳定复现，对应的确定性回归测试见
 `tests/test_recipe_version_concurrency.py`（用 SQLAlchemy `load` 事件在
-端点的读窗口内注入并发提交，精确复现竞速交错）。
+端点的读窗口内注入并发提交，精确复现「删除原行 → 同号新建草稿」等竞速交错）。
 
 ## 4. API 一览
 
@@ -363,7 +441,7 @@ bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUND
 | GET  | `/rule-sets/{code}/versions`、`/rule-sets/{code}/versions/{v}` | 版本摘要列表 / 不可变快照 |
 | POST | `/recipes` | 创建配方 |
 | POST | `/recipes/{code}/versions` | 新增草稿版本（版本号唯一） |
-| PUT/DELETE | `/recipes/{code}/versions/{v}` | 仅草稿可改/删（与发布竞速时由数据库状态原子定胜负；已发布 → 409） |
+| PUT/DELETE | `/recipes/{code}/versions/{v}` | 仅草稿可改/删（按最初读取的行 id 与发布/删除竞速原子定胜负：原行已发布 → 409；原行被删除（含同号重建）→ 404） |
 | POST | `/recipes/{code}/versions/{v}/publish` | 发布版本（幂等，发布后不可变） |
 | GET  | `/recipes…` | 查询配方及版本 |
 | POST | `/evaluations` | 评估（需 `Idempotency-Key` 头或 `idempotency_key`；可选 `rule_set_code`+`rule_set_version`） |
@@ -419,8 +497,12 @@ uvicorn app.main:app --reload
 
 - **不可变性**：原料登记即冻结；单条规则与配方版本经 `publish` 后冻结（改/删 → 409）；
   配方版本的草稿改/删与发布是**数据库层带状态守卫的条件写**（`status = 'draft'`），
-  竞速时按提交顺序原子定胜负——发布先提交则旧写 `409 RECIPE_VERSION_IMMUTABLE`，
-  已发布行永不被改写或删除，评估始终可依据稳定版本计算；
+  且失败判定**始终追踪最初读取的行主键**——竞速时按提交顺序原子定胜负：发布先提交则
+  旧写 `409 RECIPE_VERSION_IMMUTABLE`，已发布行永不被改写或删除；若原行被删除后又以
+  同配方号 + 版本号重建了新草稿，旧请求按原行 id 重查发现原行已消失，返回
+  `404 RECIPE_VERSION_NOT_FOUND` 而**不会把新行误判成旧行**（修复前旧 publish 可能
+  报 200 却仍返回 `draft`、旧 PUT/DELETE 可能误报 409）；针对同一原行的重复发布保持
+  幂等。评估始终可依据稳定版本计算；
   规则集发布生成不可变版本快照与 SHA-256 摘要，保证任意历史评估可解释、可复现。
 - **ppm 归一化与重叠检测**：规则集提交即归一化到 ppm（单位无关），同
   法域/过敏原/`applies_to`/等阈值（含边界）视为重叠；`declare`+`warning`
@@ -453,7 +535,7 @@ app/
     evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出
     rule_sets.py          # ppm 归一化、重叠冲突检测、摘要与摘要哈希
   routers/                # ingredients / rules / rule_sets / recipes / evaluations
-tests/                    # pytest（SQLite 内存库，88 个用例，含并发竞速回归）
+tests/                    # pytest（SQLite 内存库，91 个用例，含并发竞速与删除—同号重建回归）
 examples/quickstart.sh    # 端到端 curl 示例（含规则集发布、冲突与快照重放）
 examples/concurrency_check.sh  # 并发复验：草稿写 vs 发布的原子胜负顺序
 Dockerfile / docker-compose.yml
